@@ -24,6 +24,7 @@ func main() {
 	authKey := flag.String("key", "", "Cloudflare API key")
 	authEmail := flag.String("email", "", "Cloudflare API email")
 	check := flag.Bool("check", false, "Verify reachability")
+	dryRun := flag.Bool("dry-run", false, "Do not do")
 	flag.Parse()
 
 	var r io.Reader
@@ -48,16 +49,18 @@ func main() {
 	if *check {
 		var wg sync.WaitGroup
 		limit := make(chan struct{}, 4)
-		for _, rec := range wantRecords {
-			rec := rec
-			if rec.Content != "" {
-				wg.Add(1)
-				go func() {
-					limit <- struct{}{}
-					checkRecord(rec)
-					<-limit
-					wg.Done()
-				}()
+		for _, recs := range wantRecords {
+			for _, rec := range recs {
+				rec := rec
+				if rec.Content != "" {
+					wg.Add(1)
+					go func() {
+						limit <- struct{}{}
+						checkRecord(rec)
+						<-limit
+						wg.Done()
+					}()
+				}
 			}
 		}
 		wg.Wait()
@@ -81,7 +84,7 @@ func main() {
 		zoneIDs[zone.Name] = zone.ID
 	}
 
-	haveRecords := make(map[string]cfdns.DNSRecord)
+	haveRecords := make(map[string][]cfdns.DNSRecord)
 	for name, zoneID := range zoneIDs {
 		if verbose {
 			log.Println("Listing zone", name)
@@ -96,42 +99,55 @@ func main() {
 		recordMapInto(have, haveRecords)
 	}
 
-	for key, rec := range wantRecords {
-		if rec.Content == "" {
+	for key, recs := range wantRecords {
+		if len(recs) == 1 && recs[0].Content == "" {
 			// An ignore record
 			continue
 		}
 
-		if curRec, ok := haveRecords[key]; !ok {
-			log.Println("Create", rec)
-			zoneID := zoneIDFor(zoneIDs, rec.Name)
-			if err := client.CreateDNSRecord(zoneID, rec.Name, rec.Type, rec.Content); err != nil {
-				log.Fatal(err)
+		for _, rec := range recs {
+			curRecs := haveRecords[key]
+			if !nameInRecs(rec.Name, curRecs) {
+				log.Println("Create", rec)
+				zoneID := zoneIDFor(zoneIDs, rec.Name)
+				if !*dryRun {
+					if err := client.CreateDNSRecord(zoneID, rec.Name, rec.Type, rec.Content); err != nil {
+						log.Fatal(err)
+					}
+				}
+			} else if verbose {
+				log.Println("Accept", rec)
 			}
-		} else if rec.Content != curRec.Content {
-			log.Println("Update", rec)
-			curRec.Content = rec.Content
-			if err := client.UpdateDNSRecord(curRec); err != nil {
-				log.Fatal(err)
-			}
-		} else if verbose {
-			log.Println("Accept", rec)
 		}
 	}
 
-	for key, rec := range haveRecords {
-		switch rec.Type {
-		case "A", "AAAA":
-			if _, ok := wantRecords[key]; !ok {
-				log.Println("Delete", rec)
-				if err := client.DeleteDNSRecord(rec); err != nil {
-					log.Fatal(err)
+	for key, recs := range haveRecords {
+		for _, rec := range recs {
+			switch rec.Type {
+			case "A", "AAAA":
+				recs := wantRecords[key]
+				if !nameInRecs(rec.Name, recs) {
+					log.Println("Delete", rec)
+					if !*dryRun {
+						if err := client.DeleteDNSRecord(rec); err != nil {
+							log.Fatal(err)
+						}
+					}
+				} else if verbose {
+					log.Println("Retain", rec)
 				}
-			} else if verbose {
-				log.Println("Retain", rec)
 			}
 		}
 	}
+}
+
+func nameInRecs(name string, recs []cfdns.DNSRecord) bool {
+	for _, rec := range recs {
+		if rec.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func zoneIDFor(zoneIDs map[string]string, name string) string {
@@ -235,15 +251,16 @@ func loadIPList(r io.Reader) []cfdns.DNSRecord {
 	return records
 }
 
-func recordMap(recs []cfdns.DNSRecord) map[string]cfdns.DNSRecord {
-	m := make(map[string]cfdns.DNSRecord, len(recs))
+func recordMap(recs []cfdns.DNSRecord) map[string][]cfdns.DNSRecord {
+	m := make(map[string][]cfdns.DNSRecord, len(recs))
 	recordMapInto(recs, m)
 	return m
 }
 
-func recordMapInto(recs []cfdns.DNSRecord, m map[string]cfdns.DNSRecord) {
+func recordMapInto(recs []cfdns.DNSRecord, m map[string][]cfdns.DNSRecord) {
 	for _, rec := range recs {
-		m[rec.Name+"/"+rec.Type] = rec
+		key := rec.Name + "/" + rec.Type
+		m[key] = append(m[key], rec)
 	}
 }
 
