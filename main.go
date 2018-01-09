@@ -107,7 +107,7 @@ func main() {
 
 		for _, rec := range recs {
 			curRecs := haveRecords[key]
-			if !nameInRecs(rec.Name, curRecs) {
+			if !contentInRecs(rec.Content, curRecs) {
 				log.Println("Create", rec)
 				zoneID := zoneIDFor(zoneIDs, rec.Name)
 				if !*dryRun {
@@ -126,7 +126,12 @@ func main() {
 			switch rec.Type {
 			case "A", "AAAA":
 				recs := wantRecords[key]
-				if !nameInRecs(rec.Name, recs) {
+				if len(recs) == 1 && recs[0].Content == "" {
+					// An ignore record
+					continue
+				}
+
+				if !contentInRecs(rec.Content, recs) {
 					log.Println("Delete", rec)
 					if !*dryRun {
 						if err := client.DeleteDNSRecord(rec); err != nil {
@@ -141,9 +146,9 @@ func main() {
 	}
 }
 
-func nameInRecs(name string, recs []cfdns.DNSRecord) bool {
+func contentInRecs(cont string, recs []cfdns.DNSRecord) bool {
 	for _, rec := range recs {
-		if rec.Name == name {
+		if rec.Content == cont {
 			return true
 		}
 	}
@@ -167,6 +172,7 @@ type domainRewrite struct {
 func loadIPList(r io.Reader) []cfdns.DNSRecord {
 	var domains []domainRewrite
 	var records []cfdns.DNSRecord
+	variables := make(map[string]string)
 
 	br := bufio.NewScanner(r)
 	for br.Scan() {
@@ -202,6 +208,13 @@ func loadIPList(r io.Reader) []cfdns.DNSRecord {
 			domain := fields[2]
 			domains = append(domains, domainRewrite{cidr: cidr, domain: domain})
 
+		case ".variable":
+			if len(fields) != 3 {
+				fmt.Printf("Unknown format (variable): %q\n", line)
+				continue
+			}
+			variables[fields[1]] = fields[2]
+
 		default:
 			if len(fields) != 2 {
 				fmt.Printf("Unknown format (record): %q\n", line)
@@ -209,6 +222,17 @@ func loadIPList(r io.Reader) []cfdns.DNSRecord {
 
 			name := fields[0]
 			ips := strings.Split(fields[1], ",")
+
+			for i, ip := range ips {
+				if strings.HasPrefix(ip, "$") {
+					val, ok := variables[ip[1:]]
+					if !ok {
+						fmt.Printf("Unknown variable: %q\n", ip)
+						os.Exit(1)
+					}
+					ips[i] = val
+				}
+			}
 
 			var err error
 		nextIP:
@@ -239,11 +263,13 @@ func loadIPList(r io.Reader) []cfdns.DNSRecord {
 						continue nextIP
 					}
 				}
-				records = append(records, cfdns.DNSRecord{
+
+				rec := cfdns.DNSRecord{
 					Name:    name,
 					Type:    rectype,
 					Content: ip.String(),
-				})
+				}
+				records = append(records, rec)
 			}
 		}
 	}
